@@ -13,6 +13,7 @@ pub enum AppEnv {
 }
 
 impl AppEnv {
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Self {
         match s.trim().to_ascii_lowercase().as_str() {
             "production" | "prod" => AppEnv::Production,
@@ -20,7 +21,9 @@ impl AppEnv {
             _ => AppEnv::Development,
         }
     }
+}
 
+impl AppEnv {
     pub fn as_str(&self) -> &'static str {
         match self {
             AppEnv::Development => "development",
@@ -154,6 +157,9 @@ pub struct Config {
     pub processor_scaling_factor: f64,
     // Slow query logging
     pub slow_query_threshold_ms: u64,
+    // Settlement batch limits
+    pub settlement_max_batch_size: usize,
+    pub settlement_min_tx_count: usize,
 }
 
 pub mod assets;
@@ -280,6 +286,12 @@ impl Config {
                 .parse()?,
             slow_query_threshold_ms: env::var("SLOW_QUERY_THRESHOLD_MS")
                 .unwrap_or_else(|_| "500".to_string())
+                .parse()?,
+            settlement_max_batch_size: env::var("SETTLEMENT_MAX_BATCH_SIZE")
+                .unwrap_or_else(|_| "10000".to_string())
+                .parse()?,
+            settlement_min_tx_count: env::var("SETTLEMENT_MIN_TX_COUNT")
+                .unwrap_or_else(|_| "1".to_string())
                 .parse()?,
         })
     }

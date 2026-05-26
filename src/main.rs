@@ -1,6 +1,4 @@
-use axum::routing::{get, post};
 use clap::Parser;
-use opentelemetry::trace::TracerProvider as _;
 use sqlx::migrate::Migrator;
 use std::{net::SocketAddr, path::Path, sync::atomic::AtomicU64, sync::Arc};
 use synapse_core::{
@@ -12,13 +10,12 @@ use synapse_core::{
     middleware::idempotency::IdempotencyService,
     schemas,
     secrets::SecretsStore,
-    services::{FeatureFlagService, LeaderElection, SettlementService, WebhookDispatcher},
+    services::{FeatureFlagService, SettlementService, WebhookDispatcher},
     stellar::HorizonClient,
-    telemetry, ApiState, AppState, ReadinessState,
+    AppState, ReadinessState,
 };
 use tokio::sync::broadcast;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
-use tracing_opentelemetry::OpenTelemetryLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
@@ -30,8 +27,6 @@ use cli::{BackupCommands, Cli, Commands, DbCommands, TxCommands};
 #[openapi(
     paths(
         handlers::health,
-        handlers::settlements::list_settlements,
-        handlers::settlements::get_settlement,
         handlers::webhook::handle_webhook,
         handlers::webhook::callback,
         handlers::webhook::get_transaction,
@@ -41,7 +36,6 @@ use cli::{BackupCommands, Cli, Commands, DbCommands, TxCommands};
         schemas(
             handlers::HealthStatus,
             handlers::DbPoolStats,
-            handlers::settlements::Pagination,
             handlers::settlements::SettlementListResponse,
             handlers::webhook::WebhookPayload,
             handlers::webhook::WebhookResponse,
@@ -75,26 +69,21 @@ async fn main() -> anyhow::Result<()> {
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
 
     // Init OTel tracer early so the tracing layer can reference it.
-    let tracer_provider = telemetry::init_tracer("synapse-core", config.otlp_endpoint.as_deref())
-        .expect("failed to initialise OpenTelemetry tracer");
+    let _tracer_provider =
+        synapse_core::telemetry::init_tracer("synapse-core", config.otlp_endpoint.as_deref())
+            .expect("failed to initialise OpenTelemetry tracer");
 
     match config.log_format {
         config::LogFormat::Json => {
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(tracing_subscriber::fmt::layer().json())
-                .with(OpenTelemetryLayer::new(
-                    tracer_provider.tracer("synapse-core"),
-                ))
                 .init();
         }
         config::LogFormat::Text => {
             tracing_subscriber::registry()
                 .with(env_filter)
                 .with(tracing_subscriber::fmt::layer())
-                .with(OpenTelemetryLayer::new(
-                    tracer_provider.tracer("synapse-core"),
-                ))
                 .init();
         }
     }
@@ -124,6 +113,9 @@ async fn main() -> anyhow::Result<()> {
             BackupCommands::Restore { filename } => {
                 cli::handle_backup_restore(&config, &filename).await
             }
+            BackupCommands::RestorePitr { timestamp } => {
+                cli::handle_backup_restore_pitr(&config, &timestamp).await
+            }
             BackupCommands::Cleanup => cli::handle_backup_cleanup(&config).await,
         },
         Some(Commands::Config) => cli::handle_config_validate(&config),
@@ -149,7 +141,7 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
     tracing::info!("Database migrations completed");
 
     // Initialize partition manager (runs every 24 hours)
-    let partition_manager = db::partition::PartitionManager::new(pool.clone(), 24);
+    let partition_manager = db::partition::PartitionManager::new(pool.clone(), 24, None);
     partition_manager.start();
     tracing::info!("Partition manager started");
 
@@ -161,12 +153,22 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
     );
 
     // Initialize Settlement Service
-    let _settlement_service = SettlementService::new(pool.clone());
+    let _settlement_service = SettlementService::with_config(
+        pool.clone(),
+        config.settlement_max_batch_size,
+        config.settlement_min_tx_count,
+    );
 
     // Start background settlement worker
     let settlement_pool = pool.clone();
+    let settlement_max_batch = config.settlement_max_batch_size;
+    let settlement_min_tx = config.settlement_min_tx_count;
     tokio::spawn(async move {
-        let service = SettlementService::new(settlement_pool);
+        let service = SettlementService::with_config(
+            settlement_pool,
+            settlement_max_batch,
+            settlement_min_tx,
+        );
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(3600)); // Default to hourly
         loop {
             interval.tick().await;
@@ -199,8 +201,8 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
     tracing::info!("Webhook dispatcher background worker started");
 
     // Initialize metrics (OTLP exporter + pool stats background task)
-    let _metrics_handle = metrics::init_metrics()
-        .map_err(|e| anyhow::anyhow!("Failed to initialize metrics: {}", e))?;
+    let metrics_handle = metrics::init_metrics()
+        .map_err(|e| anyhow::anyhow!("Failed to initialize metrics: {e}"))?;
     tracing::info!("Metrics initialized successfully");
     metrics::spawn_pool_metrics_task(pool.clone(), 30);
 
@@ -240,8 +242,9 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
         tracing::warn!("Failed to warm cache on startup: {:?}", e);
     }
 
-    // Create broadcast channel for WebSocket notifications
-    // Channel capacity of 100 - slow clients will miss old messages (backpressure handling)
+    // Create broadcast channel for WebSocket notifications.
+    // Capacity of 100: slow subscribers will receive a RecvError::Lagged — the WS handler
+    // detects this, notifies the client with a "messages_dropped" frame, and offers resync.
     let (tx_broadcast, _) = broadcast::channel::<TransactionStatusUpdate>(100);
     tracing::info!("WebSocket broadcast channel initialized");
 
@@ -275,6 +278,10 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
     let current_batch_size = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
         config.processor_min_batch as u64,
     ));
+    // Initialize asset registry cache (refreshes every 5 minutes)
+    let _asset_cache =
+        synapse_core::AssetCache::start(pool.clone(), std::time::Duration::from_secs(300)).await;
+    tracing::info!("Asset registry cache initialized");
     let app_state = AppState {
         db: pool.clone(),
         pool_manager,
@@ -293,6 +300,7 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
         pending_queue_depth: pending_queue_depth.clone(),
         current_batch_size: current_batch_size.clone(),
         metrics_handle,
+        ws_connection_count: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
 
     // Load tenant configs on startup
@@ -335,7 +343,7 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
     // Concurrent processor pool
     let processor_pool = synapse_core::services::processor::ProcessorPool::new(
         pool.clone(),
-        horizon_client,
+        horizon_client.clone(),
         config.processor_workers,
         config.processor_poll_interval_ms,
         config.processor_min_batch,
@@ -360,22 +368,19 @@ async fn serve(config: config::Config) -> anyhow::Result<()> {
             tracing::warn!("Failed to register reconciliation job: {}", e);
         }
     } else {
-        tracing::info!(
-            "RECONCILIATION_ACCOUNT not set — daily reconciliation job not scheduled"
-        );
+        tracing::info!("RECONCILIATION_ACCOUNT not set — daily reconciliation job not scheduled");
     }
     if let Err(e) = scheduler.start().await {
         tracing::warn!("Failed to start job scheduler: {}", e);
     }
     tracing::info!("Job scheduler started");
 
-    let app = synapse_core::create_app(app_state);
+    let app = synapse_core::create_app(app_state.clone());
+    let readiness = app_state.readiness.clone();
 
     // Mount Swagger UI at /api/docs and serve OpenAPI JSON at /api/docs/openapi.json
-    let app = app.merge(
-        SwaggerUi::new("/api/docs")
-            .url("/api/docs/openapi.json", ApiDoc::openapi()),
-    );
+    let app =
+        app.merge(SwaggerUi::new("/api/docs").url("/api/docs/openapi.json", ApiDoc::openapi()));
 
     // Configure CORS if allowed origins are specified.
     let app = if !config.cors_allowed_origins.is_empty() {

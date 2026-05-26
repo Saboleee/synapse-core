@@ -1,16 +1,9 @@
 [advisories]
-# Fail on vulnerabilities with severity >= moderate
-vulnerability = "deny"
-unmaintained = "warn"
-yanked = "deny"
-notice = "warn"
-
-# Add exceptions here for false positives, e.g.:
-# ignore = ["RUSTSEC-2020-0001"]
+version = 2
 ignore = []
 
 [licenses]
-unlicensed = "deny"
+version = 2
 allow = [
     "MIT",
     "Apache-2.0",
@@ -23,7 +16,6 @@ allow = [
     "OpenSSL",
     "Zlib",
 ]
-copyleft = "warn"
 
 [bans]
 multiple-versions = "warn"

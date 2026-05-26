@@ -14,10 +14,11 @@ pub mod services;
 pub mod startup;
 pub mod stellar;
 pub mod telemetry;
-#[path = "Multi-Tenant Isolation Layer (Architecture)/src/tenant/mod.rs"]
 pub mod tenant;
 pub mod utils;
 pub mod validation;
+
+pub use config::assets::AssetCache;
 
 use crate::db::pool_manager::PoolManager;
 use crate::graphql::schema::AppSchema;
@@ -35,7 +36,7 @@ use axum::{
     Router,
 };
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::Arc;
 use tokio::sync::broadcast;
 use uuid::Uuid;
@@ -60,6 +61,8 @@ pub struct AppState {
     pub current_batch_size: Arc<AtomicU64>,
     /// Prometheus metrics handle
     pub metrics_handle: crate::metrics::MetricsHandle,
+    /// Active WebSocket connection count
+    pub ws_connection_count: Arc<AtomicUsize>,
 }
 
 impl AppState {
@@ -80,6 +83,8 @@ impl AppState {
     pub async fn test_new(database_url: &str) -> Self {
         let pool = sqlx::PgPool::connect(database_url).await.unwrap();
         let (tx, _) = broadcast::channel(100);
+        let _asset_cache =
+            AssetCache::start(pool.clone(), std::time::Duration::from_secs(300)).await;
         Self {
             db: pool.clone(),
             pool_manager: crate::db::pool_manager::PoolManager::new(database_url, None)
@@ -98,6 +103,7 @@ impl AppState {
             pending_queue_depth: Arc::new(AtomicU64::new(0)),
             current_batch_size: Arc::new(AtomicU64::new(10)),
             metrics_handle: crate::metrics::init_metrics().unwrap(),
+            ws_connection_count: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -147,7 +153,14 @@ pub fn create_app(app_state: AppState) -> Router {
     // Core API routes (shared between versioned and unversioned)
     let core_routes = Router::new()
         .route("/transactions/:id", get(handlers::webhook::get_transaction))
-        .route("/transactions", get(handlers::webhook::list_transactions_api))
+        .route(
+            "/transactions",
+            get(handlers::webhook::list_transactions_api),
+        )
+        .route(
+            "/transactions/search",
+            get(handlers::search::search_transactions_wrapper),
+        )
         .route("/settlements", get(handlers::settlements::list_settlements))
         .route(
             "/settlements/:id",
@@ -157,18 +170,14 @@ pub fn create_app(app_state: AppState) -> Router {
         .merge(webhook_routes.clone());
 
     // V1 routes — stable, with deprecation headers
-    let v1_routes = core_routes
-        .clone()
-        .layer(axum_middleware::from_fn(
-            middleware::versioning::v1_version_middleware,
-        ));
+    let v1_routes = core_routes.clone().layer(axum_middleware::from_fn(
+        middleware::versioning::v1_version_middleware,
+    ));
 
     // V2 routes — latest, with API-Version: v2 header
-    let v2_routes = core_routes
-        .clone()
-        .layer(axum_middleware::from_fn(
-            middleware::versioning::v2_version_middleware,
-        ));
+    let v2_routes = core_routes.clone().layer(axum_middleware::from_fn(
+        middleware::versioning::v2_version_middleware,
+    ));
 
     // Admin routes — quota skipped, SecretsStore injected for rotation-aware auth
     let mut admin_router = Router::new()
@@ -182,11 +191,9 @@ pub fn create_app(app_state: AppState) -> Router {
 
     admin_router
         // Unversioned routes default to V2 behaviour
-        .merge(
-            core_routes.layer(axum_middleware::from_fn(
-                middleware::versioning::v2_version_middleware,
-            )),
-        )
+        .merge(core_routes.layer(axum_middleware::from_fn(
+            middleware::versioning::v2_version_middleware,
+        )))
         // Versioned route groups
         .nest("/api/v1", v1_routes)
         .nest("/api/v2", v2_routes)
@@ -202,19 +209,55 @@ pub fn create_app(app_state: AppState) -> Router {
         .route("/stats/assets", get(handlers::stats::asset_stats))
         .route("/cache/metrics", get(handlers::stats::cache_metrics))
         // Admin: webhook endpoint health scores
-        .route("/admin/webhooks/health", get(handlers::admin::list_webhook_health))
-        .route("/admin/webhooks/health/:id", get(handlers::admin::get_webhook_health))
+        .route(
+            "/admin/webhooks/health",
+            get(handlers::admin::list_webhook_health),
+        )
+        .route(
+            "/admin/webhooks/health/:id",
+            get(handlers::admin::get_webhook_health),
+        )
         // Admin: per-tenant quota management
-        .route("/admin/quotas", get(handlers::admin::quota::list_tenant_quotas))
-        .route("/admin/quotas/:tenant_id", get(handlers::admin::quota::get_tenant_quota))
-        .route("/admin/quotas/:tenant_id", axum::routing::put(handlers::admin::quota::set_tenant_quota))
-        .route("/admin/quotas/:tenant_id/reset", axum::routing::delete(handlers::admin::quota::reset_tenant_quota))
+        .route(
+            "/admin/quotas",
+            get(handlers::admin::quota::list_tenant_quotas),
+        )
+        .route(
+            "/admin/quotas/:tenant_id",
+            get(handlers::admin::quota::get_tenant_quota),
+        )
+        .route(
+            "/admin/quotas/:tenant_id",
+            axum::routing::put(handlers::admin::quota::set_tenant_quota),
+        )
+        .route(
+            "/admin/quotas/:tenant_id/reset",
+            axum::routing::delete(handlers::admin::quota::reset_tenant_quota),
+        )
+        // Admin: active distributed locks
+        .route(
+            "/admin/locks",
+            get(handlers::admin::locks::list_active_locks),
+        )
         // Admin: settlement dispute workflow
-        .route("/admin/settlements/:id/status", axum::routing::patch(handlers::settlements::update_settlement_status))
+        .route(
+            "/admin/settlements/:id/status",
+            axum::routing::patch(handlers::settlements::update_settlement_status),
+        )
+        // Admin: reconciliation reports
+        .nest(
+            "/admin/reconciliation",
+            handlers::admin::reconciliation::reconciliation_routes(),
+        )
         .layer(axum_middleware::from_fn(
             middleware::panic_recovery::panic_recovery_middleware,
         ))
         .with_state(api_state)
+        .merge(
+            Router::new()
+                .route("/ws", get(handlers::ws::ws_handler))
+                .with_state(app_state),
+        )
         .layer(axum_middleware::from_fn(
             middleware::request_logger::request_logger_middleware,
         ))
